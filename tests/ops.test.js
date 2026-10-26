@@ -132,3 +132,43 @@ test('summarize counts the three states', () => {
   ])
   assert.deepEqual(summarize(ops), { total: 3, running: 1, failed: 1, done: 1 })
 })
+
+test('a terminal surface carries the exact command line', () => {
+  const { ops } = projectOps([call(1, 'c1', 'bash', { command: 'ls -la\n# comment', description: '列目录' })])
+  assert.equal(ops[0].surface.kind, 'terminal')
+  assert.equal(ops[0].surface.command, 'ls -la\n# comment')
+  assert.equal(ops[0].surface.description, '列目录')
+})
+
+test('terminal output keeps newlines and escape sequences verbatim', () => {
+  const raw = '\u001b[32mok\u001b[0m\nline2\n'
+  const { ops } = projectOps([call(1, 'c1', 'bash', { command: 'go test' }), result(2, 'c1', raw)])
+  assert.equal(ops[0].surface.output.includes('\u001b[32m'), true, 'ANSI is preserved for the renderer')
+  assert.equal(ops[0].surface.output.split('\n').length, 2, 'trailing newline trimmed, inner newline kept')
+})
+
+test('an edit surface exposes the replaced block', () => {
+  const { ops } = projectOps([call(1, 'c1', 'edit', { file_path: '/tmp/a.js', old_string: 'foo()', new_string: 'bar()' })])
+  assert.deepEqual(ops[0].surface, { kind: 'file', path: '/tmp/a.js', oldText: 'foo()', newText: 'bar()' })
+})
+
+test('a write surface exposes the written text, capped', () => {
+  const body = 'x'.repeat(9000)
+  const { ops } = projectOps([call(1, 'c1', 'write', { file_path: '/tmp/a.md', content: body })])
+  assert.equal(ops[0].surface.path, '/tmp/a.md')
+  assert.ok(ops[0].surface.content.length <= 8001)
+})
+
+test('a browser surface exposes the address the human would see', () => {
+  const { ops } = projectOps([call(1, 'c1', 'browser_open', { url: 'https://example.com/x' })])
+  assert.equal(ops[0].surface.kind, 'browser')
+  assert.equal(ops[0].surface.url, 'https://example.com/x')
+  assert.equal(ops[0].surface.action, 'open')
+})
+
+test('agent-facing tools read like the thing a human saw', () => {
+  assert.equal(describeCall('progress_update', { title: '宿主侧核心写完', message: '...' }, '').summary, '宿主侧核心写完')
+  assert.equal(describeCall('test_live_run', { runner: 'nodeTest', targets: ['dsh-solo/tests/*.test.js'] }, '').summary, 'nodeTest · dsh-solo/tests/*.test.js')
+  assert.equal(describeCall('todo_write', { todos: [{}, {}, {}] }, '').summary, '3 项待办')
+  assert.equal(describeCall('ask_user_question', { questions: [{ question: 'REA 指什么？' }] }, '').summary, 'REA 指什么？')
+})

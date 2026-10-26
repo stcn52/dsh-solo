@@ -6,6 +6,11 @@
  * point — "what did the agent actually do" must be derivable from the log, not
  * from what the agent says about itself.
  *
+ * Every operation also carries a `surface`: the *human view* of that action —
+ * the command line a terminal would show, the text an editor would open, the
+ * address bar a browser would display. The panel renders the surface, not a
+ * summary of it.
+ *
  * Pairs `tool/call` with `tool/result` by callId:
  * - a call without a result is still RUNNING (that is the live state)
  * - a result without a call keeps its own entry, so a mid-log start never
@@ -96,6 +101,21 @@ export function describeCall(name, args, raw) {
     const scope = pick('path', 'cwd')
     if (pattern !== '') parts.push(pattern)
     if (scope !== '') parts.push(`in ${scope}`)
+  } else if (name === 'progress_update') {
+    const title = pick('title')
+    if (title !== '') parts.push(title)
+  } else if (name === 'test_live_run') {
+    const runner = pick('runner')
+    const targets = Array.isArray(args?.targets) ? args.targets.filter(entry => typeof entry === 'string') : []
+    parts.push(runner === '' ? 'test' : runner)
+    if (targets.length > 0) parts.push(targets.join(' '))
+  } else if (name === 'todo_write') {
+    const todos = Array.isArray(args?.todos) ? args.todos : []
+    parts.push(todos.length + ' 项待办')
+  } else if (name === 'ask_user_question') {
+    const first = Array.isArray(args?.questions) ? args.questions[0] : undefined
+    const question = typeof first?.question === 'string' ? first.question : ''
+    if (question !== '') parts.push(question)
   } else if (name === 'subagent' || name === 'subagent_fork' || name === 'send_message') {
     const who = pick('agent_id', 'to', 'description')
     if (who !== '') parts.push(who)
@@ -126,6 +146,49 @@ export function resultText(event) {
     if (block?.type === 'text' && typeof block.text === 'string') chunks.push(block.text)
   }
   return chunks.join('\n')
+}
+
+/**
+ * Build the human-view payload of one call.
+ *
+ * Deliberately small: a terminal shows the command, an editor shows the text it
+ * was given, a browser shows its address. Anything the log does not carry (a
+ * page's pixels, a pty's escape stream) is not invented here.
+ * @param name - tool name.
+ * @param args - parsed arguments (undefined when the log was not JSON).
+ * @param raw - raw argument text.
+ * @returns a surface object, always with a `kind` that matches {@link kindOf}.
+ */
+export function buildSurface(name, args, raw) {
+  const pick = (...keys) => {
+    for (const key of keys) {
+      const value = args?.[key]
+      if (typeof value === 'string' && value !== '') return value
+    }
+    return ''
+  }
+  const kind = kindOf(name)
+  if (kind === 'terminal') {
+    return {
+      kind,
+      command: pick('command', 'cmd', 'code'),
+      description: pick('description'),
+      output: '',
+    }
+  }
+  if (kind === 'file') {
+    if (name === 'edit') {
+      return { kind, path: pick('file_path', 'path'), oldText: detailClip(pick('old_string', 'old_text', 'oldText'), 4000), newText: detailClip(pick('new_string', 'new_text', 'newText'), 4000) }
+    }
+    if (name === 'write') {
+      return { kind, path: pick('file_path', 'path'), content: detailClip(pick('content', 'text'), 8000) }
+    }
+    return { kind, path: pick('file_path', 'path', 'pattern') }
+  }
+  if (kind === 'browser') {
+    return { kind, action: name.slice('browser_'.length).replace(/_/g, '.'), url: pick('url'), target: pick('target', 'ref', 'selector', 'text') }
+  }
+  return { kind, raw: detailClip(raw ?? '', 2000) }
 }
 
 /**
@@ -160,6 +223,7 @@ export function projectOps(events, options = {}) {
       }
       const described = describeCall(name, parsed, rawArgs)
       const op = {
+        surface: buildSurface(name, parsed, rawArgs),
         seq,
         callId,
         name,
@@ -217,6 +281,11 @@ export function projectOps(events, options = {}) {
       target.isError = isError
       target.result = clip(text, DETAIL_CHARS)
       target.resultTruncated = text.length > DETAIL_CHARS
+      if (target.surface?.kind === 'terminal') {
+        // A terminal shows the output verbatim (newlines kept, ANSI untouched);
+        // the flattened `result` stays the one-line summary.
+        target.surface.output = detailClip(text, DETAIL_CHARS)
+      }
       const cwd = event.data?.meta?.cwd
       if (typeof cwd === 'string' && cwd !== '') target.cwd = cwd
     }
