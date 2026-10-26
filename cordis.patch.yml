@@ -1,0 +1,13 @@
+# dsh-solo bundle patch
+#
+# Installed through the official CLI:
+#
+#   dsh plugin --profile <name> add <package-or-git-url>
+#
+# The plugin manager appends `dsh-solo` to `dsh.profile.bundles`; profile boot
+# merges THIS patch, which inserts one plugin row. The row id is also the
+# settings namespace. This plugin has no config: it only reads the live session
+# log (newest 120 operations per session) and exposes it over `/solo/*`.
+- insert:
+    - id: solo
+      name: 'dsh-solo'
