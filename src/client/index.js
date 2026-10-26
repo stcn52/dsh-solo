@@ -100,6 +100,8 @@ window.__ModuleLoader__.load({
       '.dsl-ctx { color: var(--fg-muted, #98a2b3); display: block; }',
       '.dsl-urlbar { display: flex; align-items: center; gap: 6px; padding: 5px 9px; background: #161b24; border-bottom: 1px solid #222836; }',
       '.dsl-addr { flex: 1 1 auto; min-width: 0; height: 21px; display: flex; align-items: center; padding: 0 8px; border-radius: 999px; background: #0d1017; border: 1px solid #222836; font-family: var(--mono, ui-monospace, monospace); font-size: 10.5px; color: #cfd6e3; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }',
+      '.dsl-shot { display: block; width: 100%; height: auto; max-height: 430px; object-fit: contain; background: #05070b; cursor: zoom-in; }',
+      '.dsl-shotcap { padding: 3px 9px 6px; font-size: 9.5px; color: var(--fg-muted, #98a2b3); }',
       '.dsl-viewport { padding: 10px 12px; min-height: 54px; display: grid; gap: 5px; place-content: center; text-align: center; color: var(--fg-muted, #98a2b3); font-size: 10.5px; }',
       '.dsl-viewport pre { margin: 0; text-align: left; max-height: 220px; overflow: auto; font-family: var(--mono, ui-monospace, monospace); font-size: 10.5px; white-space: pre-wrap; color: #cfd6e3; }',
       '.dsl-raw { margin: 0; padding: 6px 9px 8px; max-height: 240px; overflow: auto; font-family: var(--mono, ui-monospace, monospace); font-size: 10.5px; line-height: 1.5; white-space: pre-wrap; color: #cfd6e3; }',
@@ -555,22 +557,61 @@ window.__ModuleLoader__.load({
       )
     }
 
-    /** A browser pane: the address bar the action ran against. */
+    /**
+     * Open an inline data URL in its own tab.
+     *
+     * `window.open` refuses `data:` in some browsers, so the bytes go through a
+     * blob URL first; nothing is uploaded anywhere either way.
+     * @param dataUrl - the image.
+     */
+    function openImage(dataUrl) {
+      fetch(dataUrl).then(function (response) { return response.blob() }).then(function (blob) {
+        var url = URL.createObjectURL(blob)
+        window.open(url, '_blank', 'noopener')
+        setTimeout(function () { URL.revokeObjectURL(url) }, 60000)
+      }).catch(function () {})
+    }
+
+    /**
+     * A browser pane: the address bar, and the pixels when the log carried them.
+     * @param props - `{op, surface, fallback}`; `fallback` is the session's most
+     *   recent screenshot, shown for actions that produce no image of their own.
+     */
     function BrowserPane(props) {
       var surface = props.surface || {}
       var op = props.op
       var url = surface.url || ''
+      var own = surface.image
+      var shown = own !== undefined ? own : (props.fallback !== null && props.fallback !== undefined ? props.fallback.image : null)
+      var caption = own !== undefined
+        ? '画面来自这次截图'
+        : (shown !== null ? '最近一次画面（seq ' + props.fallback.seq + '，' + props.fallback.name + '）' : '')
       return h('div', { className: 'dsl-pane' },
         h('div', { className: 'dsl-urlbar' },
           h('div', { className: 'dsl-addr', title: url }, url === '' ? 'about:blank' : url),
           h('span', { className: 'dsl-meta' }, surface.action || op.name),
         ),
-        op.result === ''
+        shown !== null
+          ? h('img', {
+              className: 'dsl-shot',
+              src: shown.dataUrl,
+              alt: '页面截图',
+              title: '点击查看原尺寸',
+              onClick: function (event) { event.stopPropagation(); openImage(shown.dataUrl) },
+            })
+          : null,
+        shown !== null && caption !== ''
+          ? h('div', { className: 'dsl-shotcap' }, caption)
+          : null,
+        shown === null
           ? h('div', { className: 'dsl-viewport' },
-              h('div', {}, '没有画面可显示'),
-              h('div', {}, op.status === 'running' ? '这个动作还在执行' : '该会话没有把页面像素写进日志'),
+              h('div', {}, surface.imageOmitted === true ? '画面太大，未随面板返回' : '没有画面可显示'),
+              h('div', {}, op.status === 'running' ? '这个动作还在执行' : '这条记录里没有内联截图（browser_screenshot 才会带）'),
             )
-          : h('div', { className: 'dsl-viewport' }, h('pre', {}, op.result)),
+          : null,
+        shown === null && op.result !== ''
+          ? h('div', { className: 'dsl-viewport' }, h('pre', {}, op.result))
+          : null,
       )
     }
 
@@ -591,7 +632,7 @@ window.__ModuleLoader__.load({
       var surface = op.surface || {}
       if (op.kind === 'terminal' && surface.command !== undefined) return h(TerminalPane, { op: op, surface: surface, live: props.live })
       if (op.kind === 'file' && (op.name === 'edit' || op.name === 'write' || op.name === 'read')) return h(EditorPane, { op: op, surface: surface })
-      if (op.kind === 'browser') return h(BrowserPane, { op: op, surface: surface })
+      if (op.kind === 'browser') return h(BrowserPane, { op: op, surface: surface, fallback: props.shot })
       return h(GenericPane, { op: op })
     }
 
@@ -599,6 +640,7 @@ window.__ModuleLoader__.load({
     function OperationRow(props) {
       var op = props.op
       var live = op.kind === 'terminal' ? matchCommand(op, props.commands || {}) : null
+      var shot = props.shot === undefined ? null : props.shot
       var meta = op.status === 'running'
         ? '进行中'
         : (op.status === 'failed' ? '失败' : '完成') + (op.durationMs > 0 ? ' · ' + duration(op.durationMs) : '')
@@ -618,7 +660,7 @@ window.__ModuleLoader__.load({
           ),
         ),
         props.open
-          ? h('div', { className: 'dsl-pane-wrap', onClick: function (event) { event.stopPropagation() } }, h(Surface, { op: op, live: live }))
+          ? h('div', { className: 'dsl-pane-wrap', onClick: function (event) { event.stopPropagation() } }, h(Surface, { op: op, live: live, shot: shot }))
           : null,
       )
     }
@@ -665,6 +707,16 @@ window.__ModuleLoader__.load({
       var counts = (data && data.counts) || { total: 0, running: 0, failed: 0, done: 0 }
       var sessions = (data && data.sessions) || []
       var visible = filter === 'all' ? ops : ops.filter(function (op) { return op.kind === filter })
+      // The newest pixel in this session: a browser action that produces no image
+      // of its own still gets to show what the page looked like.
+      var latestShot = null
+      for (var shotIndex = ops.length - 1; shotIndex >= 0; shotIndex -= 1) {
+        var candidate = ops[shotIndex]
+        if (candidate.surface && candidate.surface.image !== undefined) {
+          latestShot = { image: candidate.surface.image, seq: candidate.seq, name: candidate.name }
+          break
+        }
+      }
 
       useEffect(function () {
         var node = bodyRef.current
@@ -718,6 +770,7 @@ window.__ModuleLoader__.load({
                 return h(OperationRow, {
                   key: op.seq,
                   op: op,
+                  shot: latestShot,
                   commands: feed.commands,
                   open: openSeq === op.seq,
                   onToggle: function () { setOpenSeq(openSeq === op.seq ? -1 : op.seq) },

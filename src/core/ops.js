@@ -27,6 +27,10 @@ const SUMMARY_CHARS = 280
 const DETAIL_CHARS = 6000
 /** Upper bound on operations returned, newest kept. */
 const MAX_OPS = 400
+/** Largest single screenshot kept inline (characters of base64). */
+const MAX_IMAGE_CHARS = 4000000
+/** Total base64 budget across the returned page of operations. */
+const MAX_IMAGE_TOTAL = 6000000
 
 /**
  * Family of one tool name.
@@ -132,6 +136,27 @@ export function describeCall(name, args, raw) {
   // readable by clipping it hard.
   const fallback = clip(raw ?? '', SUMMARY_CHARS)
   return { summary: fallback, detail: detailClip(raw ?? '', DETAIL_CHARS) }
+}
+
+/**
+ * Pull the first inline screenshot out of a tool result.
+ *
+ * `browser_screenshot` answers with `{dataUrl, path}` in a *text* block, so the
+ * pixels are already in the log — they only need extracting. An image larger
+ * than the per-image cap is refused rather than truncated: half a PNG decodes
+ * to nothing, and a broken <img> is worse than an honest "too large".
+ * @param text - the tool's textual output.
+ * @returns `{mime, dataUrl}` or null.
+ */
+export function extractImage(text) {
+  if (typeof text !== 'string' || text.indexOf('data:image') < 0) return null
+  // A JSON payload may escape the slashes; the pattern below expects plain ones.
+  const plain = text.split('\\/').join('/')
+  const match = /data:image\/(png|jpeg|jpg|webp);base64,[A-Za-z0-9+/=]+/.exec(plain)
+  if (match === null) return null
+  if (match[0].length > MAX_IMAGE_CHARS) return null
+  const mime = match[1] === 'jpg' ? 'jpeg' : match[1]
+  return { mime: 'image/' + mime, dataUrl: match[0] }
 }
 
 /**
@@ -279,6 +304,8 @@ export function projectOps(events, options = {}) {
       target.endedAt = finishedAt
       target.durationMs = target.startedAt > 0 && finishedAt >= target.startedAt ? finishedAt - target.startedAt : 0
       target.isError = isError
+      const image = extractImage(text)
+      if (image !== null) target.surface.image = image
       target.result = clip(text, DETAIL_CHARS)
       target.resultTruncated = text.length > DETAIL_CHARS
       if (target.surface?.kind === 'terminal') {
@@ -292,6 +319,19 @@ export function projectOps(events, options = {}) {
   }
 
   const kept = ops.length > maxOps ? ops.slice(-maxOps) : ops
+  // Screenshot budgets are granted newest-first, so a long session keeps the
+  // frames a human is most likely to look at instead of the oldest ones.
+  let budget = MAX_IMAGE_TOTAL
+  for (let index = kept.length - 1; index >= 0; index -= 1) {
+    const image = kept[index].surface?.image
+    if (image === undefined) continue
+    if (image.dataUrl.length > budget) {
+      delete kept[index].surface.image
+      kept[index].surface.imageOmitted = true
+      continue
+    }
+    budget -= image.dataUrl.length
+  }
   return { ops: kept, lastSeq, dropped: ops.length - kept.length }
 }
 

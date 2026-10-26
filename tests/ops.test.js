@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { describeCall, kindOf, projectOps, resultText, summarize } from '../src/core/ops.js'
+import { describeCall, extractImage, kindOf, projectOps, resultText, summarize } from '../src/core/ops.js'
 
 /** One `tool/call` event. */
 function call(seq, callId, name, args, time = 1000 + seq) {
@@ -171,4 +171,48 @@ test('agent-facing tools read like the thing a human saw', () => {
   assert.equal(describeCall('test_live_run', { runner: 'nodeTest', targets: ['dsh-solo/tests/*.test.js'] }, '').summary, 'nodeTest · dsh-solo/tests/*.test.js')
   assert.equal(describeCall('todo_write', { todos: [{}, {}, {}] }, '').summary, '3 项待办')
   assert.equal(describeCall('ask_user_question', { questions: [{ question: 'REA 指什么？' }] }, '').summary, 'REA 指什么？')
+})
+
+// A 1x1 red PNG, small enough to keep inline in a fixture.
+const PNG = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=='
+
+test('a screenshot survives the projection as pixels', () => {
+  const payload = JSON.stringify({ dataUrl: PNG, path: '/tmp/shot.png' })
+  const { ops } = projectOps([call(1, 'c1', 'browser_screenshot', { format: 'png' }), result(2, 'c1', payload)])
+  assert.equal(ops[0].surface.image.dataUrl, PNG)
+  assert.equal(ops[0].surface.image.mime, 'image/png')
+})
+
+test('an escaped data URL is still recognised', () => {
+  const payload = JSON.stringify({ dataUrl: PNG }).split('/').join('\\/')
+  const { ops } = projectOps([call(1, 'c1', 'browser_screenshot', {}), result(2, 'c1', payload)])
+  assert.equal(ops[0].surface.image.dataUrl, PNG)
+})
+
+test('non-image results carry no pixels', () => {
+  const { ops } = projectOps([call(1, 'c1', 'browser_open', { url: 'https://x' }), result(2, 'c1', '{"ok":true}')])
+  assert.equal(ops[0].surface.image, undefined)
+  assert.equal(extractImage('plain text'), null)
+  assert.equal(extractImage('data:image/png;base64,!!!!'), null)
+})
+
+test('an oversized screenshot is refused instead of truncated', () => {
+  const huge = 'data:image/png;base64,' + 'A'.repeat(4000100)
+  assert.equal(extractImage(huge), null)
+})
+
+test('the newest frames win when the budget runs out', () => {
+  // Six ~1.2MB images against a 6MB budget: the oldest ones are dropped.
+  const big = 'data:image/png;base64,' + 'A'.repeat(1200000)
+  const events = []
+  for (let index = 0; index < 6; index += 1) {
+    events.push(call(index * 2 + 1, `c${index}`, 'browser_screenshot', {}))
+    events.push(result(index * 2 + 2, `c${index}`, JSON.stringify({ dataUrl: big })))
+  }
+  const { ops } = projectOps(events)
+  const withPixels = ops.filter(op => op.surface.image !== undefined)
+  const omitted = ops.filter(op => op.surface.imageOmitted === true)
+  assert.equal(withPixels.length, 4)
+  assert.deepEqual(omitted.map(op => op.seq), [1, 3])
+  assert.equal(ops.at(-1).surface.image !== undefined, true, 'the newest frame is always kept')
 })
