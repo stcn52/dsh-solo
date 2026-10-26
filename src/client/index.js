@@ -28,6 +28,9 @@ window.__ModuleLoader__.load({
     var ROUTE = '/solo'
     var POLL_MS = 900
     var KEEP = 150
+    // Live shell output comes from dsh-cmd-live (it owns the shell observation).
+    var LIVE = '/cmd-live'
+    var LIVE_KEEP_LINES = 400
 
     var FILTERS = [
       { id: 'all', label: '全部' },
@@ -98,6 +101,8 @@ window.__ModuleLoader__.load({
       '.dsl-viewport pre { margin: 0; text-align: left; max-height: 220px; overflow: auto; font-family: var(--mono, ui-monospace, monospace); font-size: 10.5px; white-space: pre-wrap; color: #cfd6e3; }',
       '.dsl-raw { margin: 0; padding: 6px 9px 8px; max-height: 240px; overflow: auto; font-family: var(--mono, ui-monospace, monospace); font-size: 10.5px; line-height: 1.5; white-space: pre-wrap; color: #cfd6e3; }',
       '.dsl-sect { padding: 4px 9px 0; font-size: 9.5px; letter-spacing: 0.07em; text-transform: uppercase; color: var(--fg-muted, #98a2b3); }',
+      '.dsl-cursor { color: #7ee0a1; animation: dsl-blink 1s step-end infinite; }',
+      '@keyframes dsl-blink { 0%,100% { opacity: 1 } 50% { opacity: 0 } }',
       '.dsl-foot { flex: 0 0 auto; display: flex; align-items: center; gap: 8px; padding: 6px 10px 8px; border-top: 1px solid var(--border, #2a2f3a); font-size: 10.5px; color: var(--fg-muted, #98a2b3); }',
       '.dsl-foot b { color: var(--fg, #e6e9ef); font-weight: 600; font-variant-numeric: tabular-nums; }',
       '.dsl-empty { padding: 16px 12px; color: var(--fg-muted, #98a2b3); display: grid; gap: 7px; line-height: 1.65; font-size: 12px; }',
@@ -178,15 +183,148 @@ window.__ModuleLoader__.load({
       return Math.floor(ms / 60000) + 'm' + Math.round((ms % 60000) / 1000) + 's'
     }
 
-    /** A terminal pane: the command line, then its output. */
+    /**
+ * Follow dsh-cmd-live's SSE feed: one connection for every command the host runs.
+ *
+ * The session log only learns a command's output when the call *ends*, so this
+ * is what makes a terminal pane live while it is still running. When the plugin
+ * is absent the feed fails once and we simply stop trying — the pane then shows
+ * the post-hoc output from the log, which is still correct, just not live.
+ */
+    function useLiveCommands() {
+      var [map, setMap] = useState({})
+      var [available, setAvailable] = useState(true)
+      useEffect(function () {
+        if (typeof EventSource === 'undefined') { setAvailable(false); return }
+        var alive = true
+        var source = new EventSource(LIVE + '/stream')
+        function patch(id, change) {
+          setMap(function (previous) {
+            var next = Object.assign({}, previous)
+            var entry = Object.assign({ id: id, status: 'running', lines: [], command: '', workdir: '', startedAt: 0 }, previous[id] || {}, change)
+            next[id] = entry
+            return next
+          })
+        }
+        source.addEventListener('init', function (event) {
+          if (!alive) return
+          setAvailable(true)
+          var payload = JSON.parse(event.data)
+          var next = {}
+          var commands = Array.isArray(payload.commands) ? payload.commands : []
+          for (var index = 0; index < commands.length; index += 1) {
+            var meta = commands[index]
+            next[meta.id] = {
+              id: meta.id,
+              command: meta.command || '',
+              workdir: meta.workdir || '',
+              status: meta.status || 'running',
+              startedAt: meta.startedAt || 0,
+              lines: [],
+            }
+          }
+          setMap(next)
+        })
+        source.addEventListener('start', function (event) {
+          if (!alive) return
+          var meta = JSON.parse(event.data)
+          patch(meta.id, {
+            command: meta.command || '',
+            workdir: meta.workdir || '',
+            status: meta.status || 'running',
+            startedAt: meta.startedAt || 0,
+          })
+        })
+        source.addEventListener('output', function (event) {
+          if (!alive) return
+          var payload = JSON.parse(event.data)
+          var lines = Array.isArray(payload.lines) ? payload.lines : []
+          setMap(function (previous) {
+            var entry = previous[payload.id]
+            if (entry === undefined) return previous
+            var merged = payload.reset === true ? lines.slice() : entry.lines.concat(lines)
+            if (merged.length > LIVE_KEEP_LINES) merged = merged.slice(-LIVE_KEEP_LINES)
+            var next = Object.assign({}, previous)
+            next[payload.id] = Object.assign({}, entry, { lines: merged })
+            return next
+          })
+        })
+        source.addEventListener('end', function (event) {
+          if (!alive) return
+          var meta = JSON.parse(event.data)
+          patch(meta.id, { status: meta.status || 'done', exitCode: meta.exitCode })
+        })
+        source.onerror = function () {
+          if (!alive) return
+          // A 404 means the plugin is not installed; a transient drop is retried
+          // by EventSource itself, so only give up when we never connected.
+          setAvailable(false)
+          source.close()
+        }
+        return function () { alive = false; source.close() }
+      }, [])
+      return { commands: map, available: available }
+    }
+
+    /** @param command - a command line. @returns a comparison key. */
+    function commandKey(command) {
+      return String(command || '').replace(/\s+/g, ' ').trim().slice(0, 200)
+    }
+
+    /**
+     * Find the live record for one logged bash call.
+     *
+     * The session log and the shell monitor share no id, so the match is by
+     * command text plus a start-time window: the same command started within a
+     * few seconds of the call. Running records win over finished ones.
+     * @param op - the projected operation.
+     * @param commands - live records by id.
+     * @returns the matching record, or null.
+     */
+    function matchCommand(op, commands) {
+      var wanted = commandKey(op.surface && op.surface.command)
+      if (wanted === '') return null
+      var best = null
+      var bestScore = -1
+      var ids = Object.keys(commands)
+      for (var index = 0; index < ids.length; index += 1) {
+        var entry = commands[ids[index]]
+        var have = commandKey(entry.command)
+        if (have === '') continue
+        var overlap = have === wanted ? 3 : (have.indexOf(wanted) >= 0 || wanted.indexOf(have) >= 0 ? 2 : 0)
+        if (overlap === 0) continue
+        var skew = Math.abs((entry.startedAt || 0) - (op.startedAt || 0))
+        if (skew > 10000) continue
+        var score = overlap * 100 - skew / 1000 + (entry.status === 'running' ? 50 : 0)
+        if (score > bestScore) { bestScore = score; best = entry }
+      }
+      return best
+    }
+
+/** A terminal pane: the command line, then its output. */
     function TerminalPane(props) {
       var surface = props.surface || {}
       var op = props.op
-      var output = surface.output || ''
+      var live = props.live
+      var liveLines = live !== null && Array.isArray(live.lines) ? live.lines : []
+      var showLive = live !== null && liveLines.length > 0
+      var output = showLive
+        ? liveLines.map(function (line) { return line.text === undefined ? '' : line.text }).join('\n')
+        : (surface.output || '')
       var commandLines = toLines(surface.command || '', 6)
-      var status = op.status === 'running'
-        ? '运行中'
-        : (op.status === 'failed' ? '退出异常' : '已退出') + (op.durationMs > 0 ? ' · ' + duration(op.durationMs) : '')
+      var status = live !== null && live.status === 'running'
+        ? '实时输出'
+        : op.status === 'running'
+          ? '运行中'
+          : (op.status === 'failed' ? '退出异常' : '已退出') + (op.durationMs > 0 ? ' · ' + duration(op.durationMs) : '')
+      if (showLive) {
+        // Follow the tail while the command keeps printing.
+        setTimeout(function () {
+          var nodes = document.querySelectorAll('.dsl-term-live')
+          var last = nodes[nodes.length - 1]
+          if (last !== undefined) last.scrollTop = last.scrollHeight
+        }, 0)
+      }
       return h('div', { className: 'dsl-pane' },
         h('div', { className: 'dsl-panehead' },
           h('b', {}, 'terminal'),
@@ -194,7 +332,7 @@ window.__ModuleLoader__.load({
           h('span', { className: 'dsl-grow' }),
           h('span', {}, status),
         ),
-        h('div', { className: 'dsl-term' },
+        h('div', { className: 'dsl-term' + (showLive ? ' dsl-term-live' : '') },
           commandLines.map(function (line, index) {
             return h('div', { className: 'dsl-prompt', key: 'cmd' + index },
               index === 0 ? '$ ' : '> ',
@@ -203,7 +341,7 @@ window.__ModuleLoader__.load({
           }),
           output === ''
             ? h('pre', { className: 'dsl-out dim' }, op.status === 'running' ? '…' : '(无输出)')
-            : h('pre', { className: 'dsl-out', dangerouslySetInnerHTML: { __html: ansiHtml(output) } }),
+            : h('pre', { className: 'dsl-out', dangerouslySetInnerHTML: { __html: ansiHtml(output) + (showLive && live.status === 'running' ? '<span class="dsl-cursor">▊</span>' : '') } }),
         ),
       )
     }
@@ -274,7 +412,7 @@ window.__ModuleLoader__.load({
     function Surface(props) {
       var op = props.op
       var surface = op.surface || {}
-      if (op.kind === 'terminal' && surface.command !== undefined) return h(TerminalPane, { op: op, surface: surface })
+      if (op.kind === 'terminal' && surface.command !== undefined) return h(TerminalPane, { op: op, surface: surface, live: props.live })
       if (op.kind === 'file' && (op.name === 'edit' || op.name === 'write' || op.name === 'read')) return h(EditorPane, { op: op, surface: surface })
       if (op.kind === 'browser') return h(BrowserPane, { op: op, surface: surface })
       return h(GenericPane, { op: op })
@@ -283,6 +421,7 @@ window.__ModuleLoader__.load({
     /** One operation row plus the surface it opens. */
     function OperationRow(props) {
       var op = props.op
+      var live = op.kind === 'terminal' ? matchCommand(op, props.commands || {}) : null
       var meta = op.status === 'running'
         ? '进行中'
         : (op.status === 'failed' ? '失败' : '完成') + (op.durationMs > 0 ? ' · ' + duration(op.durationMs) : '')
@@ -302,7 +441,7 @@ window.__ModuleLoader__.load({
           ),
         ),
         props.open
-          ? h('div', { className: 'dsl-pane-wrap', onClick: function (event) { event.stopPropagation() } }, h(Surface, { op: op }))
+          ? h('div', { className: 'dsl-pane-wrap', onClick: function (event) { event.stopPropagation() } }, h(Surface, { op: op, live: live }))
           : null,
       )
     }
@@ -314,6 +453,7 @@ window.__ModuleLoader__.load({
       var [filter, setFilter] = useState('all')
       var [sessionId, setSessionId] = useState('')
       var [openSeq, setOpenSeq] = useState(-1)
+      var feed = useLiveCommands()
       var bodyRef = useRef(null)
       var stickRef = useRef(true)
 
@@ -400,6 +540,7 @@ window.__ModuleLoader__.load({
                 return h(OperationRow, {
                   key: op.seq,
                   op: op,
+                  commands: feed.commands,
                   open: openSeq === op.seq,
                   onToggle: function () { setOpenSeq(openSeq === op.seq ? -1 : op.seq) },
                 })
@@ -410,7 +551,8 @@ window.__ModuleLoader__.load({
           h('span', {}, '运行中 ', h('b', {}, String(counts.running))),
           h('span', {}, '失败 ', h('b', {}, String(counts.failed))),
           h('span', { className: 'dsl-grow' }),
-          h('span', {}, '日志轮询 ' + (POLL_MS / 1000) + 's'),
+          h('span', { title: feed.available ? '正在跟随 dsh-cmd-live 的实时输出' : '未检测到 dsh-cmd-live：只能看命令结束后的输出' },
+            feed.available ? '实时输出 · 开' : '实时输出 · 关'),
         ),
       )
     }
