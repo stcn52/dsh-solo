@@ -12,6 +12,8 @@
 
 ![实时输出](docs/live.png)
 
+![可输入终端](docs/dock.png)
+
 ## 为什么这样做
 
 「可视化完成操作」的关键不是界面长什么样，而是**数据从哪来**。让 agent 自己上报「这一步完成了」，
@@ -81,6 +83,15 @@ GET /solo/version             宿主实际加载的插件版本
 - 命令结束后仍以日志里的完整输出为准（日志是权威，流只是提前量）；
 - `dsh-cmd-live` 不在时 SSE 失败一次即放弃，页脚显示「实时输出 · 关」，面板退回只看结束后的输出。
 
+## 自己动手：面板里的可输入终端
+
+底部「打开终端」会向宿主申请一个真 PTY（`POST /cmd-live/term/create`），xterm 用 `dsh-cmd-live` 自带的
+`/cmd-live/vendor/*`（同源，不往客户端 bundle 里再塞一份），输入走 `/term/input`、尺寸走 `/term/resize`、
+输出走 `/term/stream` 的 SSE。收起或换页即 `POST /term/close`，PTY 随宿主进程结束。
+
+这是**你自己的终端**，不是 agent 正在跑的那条命令——「看它做」和「自己上手」并排放在同一个面板里，
+互不干扰。`dsh-cmd-live` 缺席时按钮禁用并给出原因。
+
 ## 投影规则
 
 - `tool/call` 建一行，状态 `running`；`tool/result` 按 `callId` 收口，记录 `durationMs` 与 `status`。
@@ -92,7 +103,7 @@ GET /solo/version             宿主实际加载的插件版本
 
 ## 已知边界
 
-- **不是执行器**：面板不发命令、不点浏览器。要操作就在对话里让 agent 做，面板负责把它做的每一步摊开。
+- **对 agent 的操作只读，对自己的终端可写**：操作流是事实记录，改不了；可输入终端只作用于你自己新开的 PTY。
 - **浏览器只有地址栏，没有像素**：日志里没有页面截图（图片以 attachment 引用存放，不随事件走），所以浏览器窗格
   显示它作用的 URL 与返回文本。真要像素，得接 `dsh-builtin-browser` 的截图通道；本机那套工具目前起不来
   （缺 Electron 运行时、宿主无 DISPLAY）。

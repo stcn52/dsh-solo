@@ -31,6 +31,9 @@ window.__ModuleLoader__.load({
     // Live shell output comes from dsh-cmd-live (it owns the shell observation).
     var LIVE = '/cmd-live'
     var LIVE_KEEP_LINES = 400
+    // Interactive PTY: cmd-live already owns the terminal backend and vendors xterm.
+    var TERM = LIVE + '/term'
+    var VENDOR = LIVE + '/vendor/'
 
     var FILTERS = [
       { id: 'all', label: '全部' },
@@ -103,6 +106,13 @@ window.__ModuleLoader__.load({
       '.dsl-sect { padding: 4px 9px 0; font-size: 9.5px; letter-spacing: 0.07em; text-transform: uppercase; color: var(--fg-muted, #98a2b3); }',
       '.dsl-cursor { color: #7ee0a1; animation: dsl-blink 1s step-end infinite; }',
       '@keyframes dsl-blink { 0%,100% { opacity: 1 } 50% { opacity: 0 } }',
+      '.dsl-dock { flex: 0 0 auto; border-top: 1px solid var(--border, #2a2f3a); background: #0d1017; height: 260px; display: flex; flex-direction: column; min-height: 0; }',
+      '.dsl-dockhead { display: flex; align-items: center; gap: 7px; padding: 4px 8px; background: rgba(255,255,255,0.04); font-size: 10px; color: var(--fg-muted, #98a2b3); font-family: var(--mono, ui-monospace, monospace); }',
+      '.dsl-dockhead b { color: var(--fg, #e6e9ef); }',
+      '.dsl-dockbtn { font: inherit; font-size: 10px; height: 18px; padding: 0 7px; border-radius: 4px; border: 1px solid var(--border, #2a2f3a); background: transparent; color: var(--fg-muted, #98a2b3); cursor: pointer; }',
+      '.dsl-dockbtn:hover { color: var(--fg, #e6e9ef); border-color: var(--border-strong, #3a4150); }',
+      '.dsl-dockbody { flex: 1 1 auto; min-height: 0; padding: 4px 6px; overflow: hidden; }',
+      '.dsl-dockbody .xterm { height: 100%; }',
       '.dsl-foot { flex: 0 0 auto; display: flex; align-items: center; gap: 8px; padding: 6px 10px 8px; border-top: 1px solid var(--border, #2a2f3a); font-size: 10.5px; color: var(--fg-muted, #98a2b3); }',
       '.dsl-foot b { color: var(--fg, #e6e9ef); font-weight: 600; font-variant-numeric: tabular-nums; }',
       '.dsl-empty { padding: 16px 12px; color: var(--fg-muted, #98a2b3); display: grid; gap: 7px; line-height: 1.65; font-size: 12px; }',
@@ -301,6 +311,173 @@ window.__ModuleLoader__.load({
       return best
     }
 
+/**
+ * Load cmd-live's vendored xterm once.
+ *
+ * Same origin, no bundler: the plugin ships the UMD builds, so the panel reuses
+ * them instead of adding a second copy of xterm to the client bundle.
+ * @returns a promise resolving to `{Terminal, FitAddon}`.
+ */
+    var xtermPromise = null
+    function loadXterm() {
+      if (xtermPromise !== null) return xtermPromise
+      xtermPromise = new Promise(function (resolve, reject) {
+        if (window.Terminal !== undefined) { resolve({ Terminal: window.Terminal, FitAddon: window.FitAddon }); return }
+        var link = document.createElement('link')
+        link.rel = 'stylesheet'
+        link.href = VENDOR + 'xterm.css'
+        document.head.appendChild(link)
+        var pending = 2
+        function done() {
+          pending -= 1
+          if (pending > 0) return
+          if (window.Terminal === undefined) { reject(new Error('xterm 未能加载')); return }
+          resolve({ Terminal: window.Terminal, FitAddon: window.FitAddon })
+        }
+        for (const file of ['xterm.js', 'addon-fit.js']) {
+          var script = document.createElement('script')
+          script.src = VENDOR + file
+          script.onload = done
+          script.onerror = function () { reject(new Error('加载 ' + file + ' 失败')) }
+          document.head.appendChild(script)
+        }
+      })
+      return xtermPromise
+    }
+
+    /**
+     * The interactive terminal dock: a real PTY the human drives.
+     *
+     * The agent's own bash calls are *not* attached here — this is a terminal of
+     * your own inside the same panel, so "看它做" and "自己动手" live side by side.
+     * @param props - `{onClose}`.
+     */
+    function TerminalDock(props) {
+      var hostRef = useRef(null)
+      var [status, setStatus] = useState('连接中…')
+      var sessionRef = useRef(null)
+
+      useEffect(function () {
+        var alive = true
+        var term = null
+        var fit = null
+        var source = null
+        var id = ''
+        var disposer = null
+
+        function fail(message) {
+          if (alive) setStatus(message)
+        }
+
+        loadXterm().then(function (libs) {
+          if (!alive || hostRef.current === null) return
+          term = new libs.Terminal({
+            fontSize: 11.5,
+            fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace',
+            cursorBlink: true,
+            convertEol: true,
+            theme: { background: '#0d1017', foreground: '#cfd6e3', cursor: '#7ee0a1' },
+            scrollback: 2000,
+          })
+          if (libs.FitAddon !== undefined) {
+            var Ctor = libs.FitAddon.FitAddon || libs.FitAddon
+            fit = new Ctor()
+            term.loadAddon(fit)
+          }
+          term.open(hostRef.current)
+          if (fit !== null) fit.fit()
+
+          var cols = term.cols
+          var rows = term.rows
+          return fetch(TERM + '/create', {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ cols: cols, rows: rows }),
+          }).then(function (response) {
+            return response.json().then(function (body) {
+              if (!response.ok) throw new Error(body && body.error ? body.error : 'HTTP ' + response.status)
+              return body
+            })
+          }).then(function (body) {
+            if (!alive) return
+            id = body.terminal && body.terminal.id ? body.terminal.id : ''
+            sessionRef.current = id
+            term.writeln('\u001b[38;5;244m已连上宿主 PTY (' + (id || '?') + ')，可直接输入命令\u001b[0m')
+            setStatus('已连接')
+
+            source = new EventSource(TERM + '/stream?id=' + encodeURIComponent(id) + '&since=0')
+            source.addEventListener('init', function (event) {
+              var payload = JSON.parse(event.data)
+              var chunks = Array.isArray(payload.chunks) ? payload.chunks : []
+              for (var index = 0; index < chunks.length; index += 1) {
+                if (chunks[index] && typeof chunks[index].text === 'string') term.write(chunks[index].text)
+              }
+            })
+            source.addEventListener('data', function (event) {
+              var payload = JSON.parse(event.data)
+              if (typeof payload.text === 'string') term.write(payload.text)
+            })
+            source.addEventListener('exit', function () {
+              if (!alive) return
+              term.writeln('\r\n\u001b[38;5;244m[进程已退出]\u001b[0m')
+              setStatus('已退出')
+              if (source !== null) source.close()
+            })
+            source.onerror = function () { fail('输出连接中断') }
+
+            disposer = term.onData(function (data) {
+              fetch(TERM + '/input', {
+                method: 'POST',
+                headers: { 'content-type': 'application/json' },
+                body: JSON.stringify({ id: id, data: data }),
+              }).catch(function () {})
+            })
+            term.onResize(function (size) {
+              fetch(TERM + '/resize', {
+                method: 'POST',
+                headers: { 'content-type': 'application/json' },
+                body: JSON.stringify({ id: id, cols: size.cols, rows: size.rows }),
+              }).catch(function () {})
+            })
+            term.focus()
+          })
+        }).catch(function (cause) {
+          fail(String(cause && cause.message ? cause.message : cause))
+        })
+
+        function onWindowResize() {
+          if (fit !== null && alive) { try { fit.fit() } catch {} }
+        }
+        window.addEventListener('resize', onWindowResize)
+
+        return function () {
+          alive = false
+          window.removeEventListener('resize', onWindowResize)
+          if (source !== null) source.close()
+          if (disposer !== null) disposer.dispose()
+          if (id !== '') {
+            fetch(TERM + '/close', {
+              method: 'POST',
+              headers: { 'content-type': 'application/json' },
+              body: JSON.stringify({ id: id }),
+            }).catch(function () {})
+          }
+          if (term !== null) term.dispose()
+          sessionRef.current = null
+        }
+      }, [])
+
+      return h('div', { className: 'dsl-dock' },
+        h('div', { className: 'dsl-dockhead' },
+          h('b', {}, '终端'),
+          h('span', {}, status),
+          h('span', { className: 'dsl-grow' }),
+          h('button', { className: 'dsl-dockbtn', onClick: props.onClose, title: '关闭并结束这个 PTY' }, '关闭'),
+        ),
+        h('div', { className: 'dsl-dockbody', ref: hostRef }),
+      )
+    }
+
 /** A terminal pane: the command line, then its output. */
     function TerminalPane(props) {
       var surface = props.surface || {}
@@ -453,6 +630,7 @@ window.__ModuleLoader__.load({
       var [filter, setFilter] = useState('all')
       var [sessionId, setSessionId] = useState('')
       var [openSeq, setOpenSeq] = useState(-1)
+      var [dockOpen, setDockOpen] = useState(false)
       var feed = useLiveCommands()
       var bodyRef = useRef(null)
       var stickRef = useRef(true)
@@ -546,13 +724,18 @@ window.__ModuleLoader__.load({
                 })
               }),
         ),
+        dockOpen && feed.available ? h(TerminalDock, { onClose: function () { setDockOpen(false) } }) : null,
         h('div', { className: 'dsl-foot' },
           h('span', {}, '操作 ', h('b', {}, String(counts.total))),
           h('span', {}, '运行中 ', h('b', {}, String(counts.running))),
           h('span', {}, '失败 ', h('b', {}, String(counts.failed))),
           h('span', { className: 'dsl-grow' }),
-          h('span', { title: feed.available ? '正在跟随 dsh-cmd-live 的实时输出' : '未检测到 dsh-cmd-live：只能看命令结束后的输出' },
-            feed.available ? '实时输出 · 开' : '实时输出 · 关'),
+          h('button', {
+            className: 'dsl-dockbtn',
+            disabled: !feed.available,
+            title: feed.available ? '在面板里开一个可输入的 PTY（与 agent 的命令互不干扰）' : '需要 dsh-cmd-live 提供 PTY 后端',
+            onClick: function () { setDockOpen(!dockOpen) },
+          }, dockOpen ? '收起终端' : '打开终端'),
         ),
       )
     }
